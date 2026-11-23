@@ -245,7 +245,10 @@ export class EventController {
 	// reads collapses into one group even across completion boundaries.
 	#lastVisibleBlockCount = 0;
 	#renderedCustomMessages = new Set<string>();
-	#lastIntent: string | undefined = undefined;
+	// In start order, so the working row can fall back to another running call.
+	#runningToolIntents = new Map<string, string>();
+	#workingIntentCallId: string | undefined;
+	#workingIntent: string | undefined;
 	/** Returned calls parked for their background job's frames ({@link parksAsBackground}). */
 	#backgroundCallIds = new Set<string>();
 	/**
@@ -624,6 +627,7 @@ export class EventController {
 			for (const id of ids) {
 				this.#toolArgsReveal.finish(id);
 				this.ctx.pendingTools.delete(id);
+				this.#forgetToolIntent(id);
 			}
 			card.seal();
 		}
@@ -774,6 +778,7 @@ export class EventController {
 		}
 		this.ctx.pendingTools.delete(toolCallId);
 		this.#toolTimelineComponents.delete(toolCallId);
+		this.#forgetToolIntent(toolCallId);
 		this.#clearReadToolCall(toolCallId);
 	}
 
@@ -813,6 +818,12 @@ export class EventController {
 		if (this.#executionStartedCallIds.delete(oldId)) {
 			this.#executionStartedCallIds.add(newId);
 		}
+		const intent = this.#runningToolIntents.get(oldId);
+		if (intent !== undefined) {
+			this.#runningToolIntents.delete(oldId);
+			this.#runningToolIntents.set(newId, intent);
+		}
+		if (this.#workingIntentCallId === oldId) this.#workingIntentCallId = newId;
 		const readArgs = this.#readToolCallArgs.get(oldId);
 		if (readArgs !== undefined) {
 			this.#readToolCallArgs.delete(oldId);
@@ -948,11 +959,37 @@ export class EventController {
 		return component;
 	}
 
-	#updateWorkingMessageFromIntent(trimmed: string | undefined): void {
-		if (this.ctx.session.isAborting) return;
-		if (!trimmed || trimmed === this.#lastIntent) return;
-		this.#lastIntent = trimmed;
-		this.ctx.setWorkingMessage(trimmed);
+	#setWorkingToolIntent(toolCallId: string | undefined, intent: string | undefined): void {
+		this.#workingIntentCallId = toolCallId;
+		if (intent === this.#workingIntent) return;
+		this.#workingIntent = intent;
+		if (!this.ctx.session.isAborting && !this.#showingAsyncWait) this.ctx.setWorkingMessage(intent);
+	}
+
+	#forgetToolIntent(toolCallId: string): void {
+		this.#runningToolIntents.delete(toolCallId);
+		if (this.#workingIntentCallId !== toolCallId) return;
+		let nextId: string | undefined;
+		let nextIntent: string | undefined;
+		for (const [id, intent] of this.#runningToolIntents) {
+			nextId = id;
+			nextIntent = intent;
+		}
+		this.#setWorkingToolIntent(nextId, nextIntent);
+	}
+
+	#resetToolIntents(): void {
+		this.#runningToolIntents.clear();
+		this.#workingIntentCallId = undefined;
+		this.#workingIntent = undefined;
+	}
+
+	#hasToolCompletion(toolCallId: string): boolean {
+		return (
+			this.#orphanedToolCompletions.has(toolCallId) ||
+			this.#backgroundCallIds.has(toolCallId) ||
+			(this.#toolTimelineComponents.has(toolCallId) && !this.ctx.pendingTools.has(toolCallId))
+		);
 	}
 
 	subscribeToAgent(): void {
@@ -1133,7 +1170,7 @@ export class EventController {
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
-		this.#lastIntent = undefined;
+		this.#resetToolIntents();
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#pendingStreamPreviews.clear();
@@ -1296,13 +1333,10 @@ export class EventController {
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
 		this.#toolReplyBlocks.clear();
-		this.#lastIntent = undefined;
-		// Something outside woke the run: the row stops naming the wait and
-		// follows this loop's intents again.
-		if (this.#showingAsyncWait) {
-			this.#showingAsyncWait = false;
-			this.ctx.setWorkingMessage();
-		}
+		// A new loop must not inherit a tool intent or an outside-work label.
+		if (this.#workingIntentCallId !== undefined || this.#showingAsyncWait) this.ctx.setWorkingMessage();
+		this.#showingAsyncWait = false;
+		this.#resetToolIntents();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#resetReadGroup();
@@ -1890,7 +1924,7 @@ export class EventController {
 			const blocks = this.ctx.streamingMessage.content;
 			for (let index = blocks.length - 1; index >= 0; index--) {
 				const block = blocks[index];
-				if (block?.type !== "toolCall") continue;
+				if (block?.type !== "toolCall" || this.#hasToolCompletion(block.id)) continue;
 				const args = block.arguments;
 				if (!args || typeof args !== "object") continue;
 				let intent: string | undefined;
@@ -1906,7 +1940,7 @@ export class EventController {
 					}
 				}
 				if (!intent) continue;
-				this.#updateWorkingMessageFromIntent(intent);
+				this.#setWorkingToolIntent(block.id, intent);
 				break;
 			}
 
@@ -2129,9 +2163,15 @@ export class EventController {
 	async #handleToolExecutionStart(event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>): Promise<void> {
 		if (this.#retractedToolCallIds.has(event.toolCallId)) return;
 		this.#ensureWorkingLoaderWhileStreaming();
-		this.#updateWorkingMessageFromIntent(
-			workingIntentLabel(event.intent ?? (isRecord(event.args) ? event.args[INTENT_FIELD] : undefined)),
-		);
+		if (!this.ctx.session.isAborting && !this.#hasToolCompletion(event.toolCallId)) {
+			const intent =
+				workingIntentLabel(event.intent ?? (isRecord(event.args) ? event.args[INTENT_FIELD] : undefined)) ??
+				(this.#workingIntentCallId === event.toolCallId ? this.#workingIntent : undefined);
+			if (intent !== undefined) {
+				this.#runningToolIntents.set(event.toolCallId, intent);
+				this.#setWorkingToolIntent(event.toolCallId, intent);
+			}
+		}
 		const tool = this.ctx.viewSession.getToolByName(event.toolName);
 		const renderToolName = toolRenderName(event.toolName, tool);
 		this.#resolveDisplaceablePoll(renderToolName);
@@ -2263,6 +2303,7 @@ export class EventController {
 	): void {
 		if (event.toolName === "read") this.#inlineReadToolImages(event.toolCallId, event.result);
 		this.#applyToolCompletion(component, event);
+		this.#forgetToolIntent(event.toolCallId);
 		if (event.toolName === "read") this.#clearReadToolCall(event.toolCallId);
 		if (
 			component instanceof ToolExecutionComponent &&
@@ -2334,6 +2375,7 @@ export class EventController {
 		// which only fire `tool_execution_end`, never `_update` — do not leave
 		// the UI looking idle while the session keeps streaming (#3857).
 		this.#ensureWorkingLoaderWhileStreaming();
+		this.#forgetToolIntent(event.toolCallId);
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
 				const component = this.ctx.pendingTools.get(event.toolCallId);
@@ -2590,6 +2632,7 @@ export class EventController {
 		this.#pendingStreamPreviews.clear();
 		this.#retractedToolCallIds.clear();
 		this.#executionStartedCallIds.clear();
+		this.#resetToolIntents();
 		this.#syntheticFailureCards.clear();
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();

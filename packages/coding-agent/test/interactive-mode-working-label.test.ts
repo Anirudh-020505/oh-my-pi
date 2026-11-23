@@ -1,13 +1,9 @@
-/**
- * A live (function) working label — the background-job wait row — is re-read
- * on every tick and kept to one terminal row. Without the clamp a long list of
- * job ids wrapped the working row onto a second line at narrow widths.
- */
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -17,13 +13,13 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 const COLUMNS = 40;
 
-describe("InteractiveMode live working label", () => {
+describe("InteractiveMode working label", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let session: AgentSession;
 	let mode: InteractiveMode;
 
-	beforeAll(async () => {
+	beforeEach(async () => {
 		await initTheme();
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-working-label-");
@@ -42,7 +38,7 @@ describe("InteractiveMode live working label", () => {
 		Object.defineProperty(mode.ui.terminal, "columns", { get: () => COLUMNS, configurable: true });
 	});
 
-	afterAll(async () => {
+	afterEach(async () => {
 		mode.stop();
 		await session.dispose();
 		authStorage.close();
@@ -62,5 +58,43 @@ describe("InteractiveMode live working label", () => {
 		expect(rows).toHaveLength(1);
 		expect(rows[0]).toContain("Waiting for 6 background jobs");
 		expect(Bun.stringWidth(rows[0] ?? "")).toBeLessThanOrEqual(COLUMNS);
+	});
+
+	it("names only a still-running tool when parallel calls finish out of order", async () => {
+		mode.isInitialized = true;
+		const workingRow = () =>
+			mode.statusContainer
+				.render(COLUMNS)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+		const controller = new EventController(mode);
+		await controller.handleEvent({ type: "agent_start" });
+		const start = (toolCallId: string, intent: string) =>
+			controller.handleEvent({
+				type: "tool_execution_start",
+				toolCallId,
+				toolName: "bash",
+				args: { command: "date -u" },
+				intent,
+			});
+		const finish = (toolCallId: string) =>
+			controller.handleEvent({
+				type: "tool_execution_end",
+				toolCallId,
+				toolName: "bash",
+				result: { content: [{ type: "text", text: "command output" }], details: undefined },
+				isError: false,
+			});
+		await start("first", "Timing first command");
+		await start("second", "Timing second command");
+		expect(workingRow()).toContain("Timing second command");
+
+		await finish("second");
+		expect(workingRow()).toContain("Timing first command");
+		expect(workingRow()).not.toContain("Timing second command");
+
+		await finish("first");
+		expect(workingRow()).toContain("Working");
+		expect(workingRow()).not.toContain("Timing first command");
 	});
 });
