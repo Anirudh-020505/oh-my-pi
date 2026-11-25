@@ -292,3 +292,95 @@ describe("downloadBuildFile", () => {
 		expect(await Bun.file(targetPath).exists()).toBe(false);
 	});
 });
+
+describe("downloadBuildFile slow-download pacing", () => {
+	const url = "https://r2.test/omp-linux-x64";
+	const content = "0123456789".repeat(10);
+	let temp: TempDir | undefined;
+
+	afterEach(async () => {
+		await temp?.remove();
+		temp = undefined;
+	});
+
+	async function target(): Promise<string> {
+		temp = await TempDir.create("@omp-build-download-");
+		return path.join(temp.path(), "omp-linux-x64");
+	}
+
+	/** A body streamed in ten chunks while the injected clock advances 1 s per call. */
+	function chunkedBody(): ReadableStream<Uint8Array> {
+		const encoder = new TextEncoder();
+		let pulls = 0;
+		return new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (pulls === 10) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(encoder.encode(content.slice(pulls * 10, pulls * 10 + 10)));
+				pulls++;
+			},
+		});
+	}
+
+	function fastClock(): () => number {
+		let calls = 0;
+		return () => calls++ * 1000;
+	}
+
+	it("aborts a download whose projected total time exceeds the ceiling", async () => {
+		const targetPath = await target();
+
+		await expect(
+			downloadBuildFile({
+				url,
+				targetPath,
+				size: Buffer.byteLength(content),
+				sha256: sha(content),
+				fetchImpl: async () => new Response(chunkedBody()),
+				slowDownload: { observeMs: 1000, ceilingMs: 2000, stallMs: 60_000, now: fastClock() },
+			}),
+		).rejects.toThrow("projects past the 0-minute ceiling");
+		expect(await Bun.file(targetPath).exists()).toBe(false);
+	});
+
+	it("keeps a download whose projected total time fits the ceiling", async () => {
+		const targetPath = await target();
+
+		await downloadBuildFile({
+			url,
+			targetPath,
+			size: Buffer.byteLength(content),
+			sha256: sha(content),
+			fetchImpl: async () => new Response(chunkedBody()),
+			slowDownload: { observeMs: 1000, ceilingMs: 60_000_000, stallMs: 60_000, now: fastClock() },
+		});
+
+		expect(await Bun.file(targetPath).text()).toBe(content);
+	});
+
+	it("aborts a download that stops delivering bytes for the stall window", async () => {
+		const targetPath = await target();
+		const encoder = new TextEncoder();
+
+		await expect(
+			downloadBuildFile({
+				url,
+				targetPath,
+				size: Buffer.byteLength(content),
+				sha256: sha(content),
+				fetchImpl: async () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(encoder.encode(content.slice(0, 10)));
+							},
+						}),
+					),
+				slowDownload: { observeMs: 60_000, ceilingMs: 600_000, stallMs: 50 },
+			}),
+		).rejects.toThrow("stalled: no bytes for 0s");
+		expect(await Bun.file(targetPath).exists()).toBe(false);
+	});
+});

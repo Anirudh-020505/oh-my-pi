@@ -38,6 +38,8 @@ import {
 	downloadBuildFile,
 	type Fetch,
 	fetchBuild,
+	isRetryableDownloadError,
+	type SlowDownloadOptions,
 	type UpdateChannel,
 } from "./build-service";
 import { managedInstallName } from "./managed-install";
@@ -55,6 +57,18 @@ import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 const PACKAGE = "@oh-my-pi/pi-coding-agent";
 const HOMEBREW_FORMULA = "can1357/tap/omp";
 const MISE_TOOL = "github:can1357/oh-my-pi";
+/** GitHub repository whose releases mirror the omp build files, tag `v<version>`, asset named like the build file. */
+const GITHUB_RELEASES_REPO = "can1357/oh-my-pi";
+
+/**
+ * GitHub release asset URL mirroring a build service file: the full binary is
+ * published at `https://github.com/can1357/oh-my-pi/releases/download/v<version>/<file>`
+ * for every stable release, byte-identical to the build service's copy.
+ */
+export function githubReleaseAssetUrl(version: string, fileName: string): string {
+	return `https://github.com/${GITHUB_RELEASES_REPO}/releases/download/v${version}/${fileName}`;
+}
+
 const NIX_STORE_DIR = "/nix/store";
 const RELEASE_METADATA_TIMEOUT_MS = 30_000;
 
@@ -1791,6 +1805,8 @@ export interface BuildDownloadOptions {
 	fetchImpl?: Fetch;
 	applyPatch?: BinaryPatchApplier;
 	onProgress?: UpdateProgressListener;
+	/** Pacing ceiling for the whole-file download, passed to {@link downloadBuildFile}. */
+	slowDownload?: SlowDownloadOptions;
 }
 
 /** Size and lowercase hex SHA-256 of a file, streamed. */
@@ -1865,6 +1881,12 @@ async function installFromPatch(
  * An answer may instead say a patch is being made (`patch_pending`). This
  * interactive command never waits for it: the whole file installs now, and the
  * check that got that answer has already queued the patch for later updaters.
+ *
+ * When the whole-file download fails transiently — timed out, network error,
+ * 5xx, projected too slow, or stalled ({@link isRetryableDownloadError}) — it
+ * is retried once from the version's GitHub release asset, verified against
+ * the same size and SHA-256. A size or digest mismatch is never retried: the
+ * bytes arrived, so a mirror would only launder the corruption.
  */
 async function downloadBuild(
 	build: BuildAnswer,
@@ -1873,15 +1895,40 @@ async function downloadBuild(
 ): Promise<void> {
 	if (build.patch && (await installFromPatch(build, build.patch, paths, options))) return;
 	console.log(chalk.dim(`Downloading ${build.file.name} (${formatBytes(build.file.size)})…`));
-	await downloadBuildFile({
-		url: build.download,
+	const downloadOptions = {
 		targetPath: paths.tempPath,
 		size: build.file.size,
 		sha256: build.file.sha256,
 		fetchImpl: options.fetchImpl,
-		onProgress: received =>
+		slowDownload: options.slowDownload,
+		onProgress: (received: number) =>
 			options.onProgress?.({ phase: "downloading", version: build.version, received, total: build.file.size }),
-	});
+	};
+	try {
+		await downloadBuildFile({ ...downloadOptions, url: build.download });
+	} catch (primaryError) {
+		// The build service can be unreachable or — on some networks — so slow
+		// (a degraded edge serving the ~234 MB file at ~28 KB/s, with `Range`
+		// ignored so a resume is impossible) that the download can never finish
+		// inside the ceiling. Every stable release is mirrored on GitHub
+		// byte-identically, so retry the whole file from the release asset,
+		// checked against the same size and SHA-256 the answer carried. A
+		// canary build has no release asset; that failure is reported together
+		// with the primary one.
+		if (!isRetryableDownloadError(primaryError)) throw primaryError;
+		const fallbackUrl = githubReleaseAssetUrl(build.version, build.file.name);
+		const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+		console.log(chalk.dim(`Build service download failed (${primaryMessage}); trying the GitHub release asset…`));
+		try {
+			await downloadBuildFile({ ...downloadOptions, url: fallbackUrl });
+		} catch (fallbackError) {
+			const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+			throw new Error(
+				`Download failed from ${build.download} (${primaryMessage}) and from the GitHub release asset ${fallbackUrl} (${fallbackMessage}); the asset should exist at https://github.com/${GITHUB_RELEASES_REPO}/releases`,
+				{ cause: fallbackError },
+			);
+		}
+	}
 	await fs.promises.chmod(paths.tempPath, 0o755);
 	console.log(chalk.dim(`Verified sha256:${build.file.sha256}`));
 }

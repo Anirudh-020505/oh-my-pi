@@ -16,6 +16,7 @@ import {
 	buildNpmInstallArgs,
 	buildNpmUpdateEnv,
 	buildRenameCleanupPackages,
+	githubReleaseAssetUrl,
 	type InstalledVersionVerification,
 	type ManagerUpdateSteps,
 	migrateRenamedInstall,
@@ -1850,5 +1851,181 @@ describe("update-cli manager update recovery", () => {
 		await expect(updateViaManager(release, launcherPath, steps)).rejects.toThrow(
 			"update did not produce a working launcher and binary repair failed: Error: no binary asset",
 		);
+	});
+});
+
+describe("update-cli GitHub release fallback", () => {
+	const version = "18.1.13";
+	const content = "0123456789".repeat(10);
+	const altered = "abcdefghij".repeat(10);
+	const fallbackUrl = githubReleaseAssetUrl(version, "omp-linux-x64");
+
+	/** Install `build` over a file holding `installed`, recording every URL fetched. */
+	async function install(
+		build: BuildAnswer,
+		fetchImpl: Fetch,
+		options: updateCli.BuildDownloadOptions = {},
+	): Promise<{ dir: string; targetPath: string; requested: string[] }> {
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "omp-linux-x64");
+		await Bun.write(targetPath, "installed omp 18.1.12");
+		await fs.chmod(targetPath, 0o755);
+		const requested: string[] = [];
+		const recordingFetch: Fetch = async input => {
+			const requestUrl = String(input);
+			requested.push(requestUrl);
+			return fetchImpl(requestUrl);
+		};
+		await updateViaBinaryAt(targetPath, build, {
+			fetchImpl: recordingFetch,
+			verifyInstalledVersion: async v => ({ ok: true, actual: v, path: targetPath }),
+			...options,
+		});
+		return { dir, targetPath, requested };
+	}
+
+	/** A body streamed in ten chunks while the injected clock advances 1 s per chunk. */
+	function chunkedBody(): ReadableStream<Uint8Array> {
+		const encoder = new TextEncoder();
+		let pulls = 0;
+		return new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (pulls === 10) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(encoder.encode(content.slice(pulls * 10, pulls * 10 + 10)));
+				pulls++;
+			},
+		});
+	}
+
+	/** A clock advancing 1 s per call, so the second chunk already projects past a 2 s ceiling. */
+	function fastClock(): () => number {
+		let calls = 0;
+		return () => calls++ * 1000;
+	}
+
+	it("does not touch the GitHub release asset when the primary download succeeds", async () => {
+		const build = buildAnswer(version, content);
+
+		const { dir, targetPath, requested } = await install(build, async url => {
+			expect(url).toBe(build.download);
+			return new Response(content);
+		});
+
+		expect(await Bun.file(targetPath).text()).toBe(content);
+		expect(requested).toEqual([build.download]);
+		expect((await fs.readdir(dir)).filter(name => name !== "omp-linux-x64")).toEqual(["omp-linux-x64.lock"]);
+	});
+
+	it("falls back to the GitHub release asset when the primary download projects too slow", async () => {
+		const build = buildAnswer(version, content);
+
+		const { dir, targetPath, requested } = await install(
+			build,
+			async url => {
+				if (url === build.download) return new Response(chunkedBody());
+				if (url === fallbackUrl) return new Response(content);
+				throw new Error(`Unexpected request: ${url}`);
+			},
+			{
+				slowDownload: { observeMs: 1000, ceilingMs: 2000, stallMs: 60_000, now: fastClock() },
+			},
+		);
+
+		expect(await Bun.file(targetPath).text()).toBe(content);
+		expect(requested).toEqual([build.download, fallbackUrl]);
+		expect((await fs.readdir(dir)).filter(name => name !== "omp-linux-x64")).toEqual(["omp-linux-x64.lock"]);
+	});
+
+	it("falls back to the GitHub release asset when the primary download fails at the network level", async () => {
+		const build = buildAnswer(version, content);
+
+		const { targetPath, requested } = await install(build, async url => {
+			if (url === build.download) throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+			if (url === fallbackUrl) return new Response(content);
+			throw new Error(`Unexpected request: ${url}`);
+		});
+
+		expect(await Bun.file(targetPath).text()).toBe(content);
+		expect(requested).toEqual([build.download, fallbackUrl]);
+	});
+
+	it("never falls back on a digest mismatch from the primary download", async () => {
+		const build = buildAnswer(version, altered);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "omp-linux-x64");
+		await Bun.write(targetPath, "installed omp 18.1.12");
+		const requested: string[] = [];
+
+		await expect(
+			updateViaBinaryAt(targetPath, build, {
+				fetchImpl: async input => {
+					requested.push(String(input));
+					if (String(input) === build.download) return new Response(content);
+					throw new Error(`Unexpected request: ${String(input)}`);
+				},
+				slowDownload: { observeMs: 1000, ceilingMs: 2000, stallMs: 60_000, now: fastClock() },
+			}),
+		).rejects.toThrow("digest mismatch");
+
+		expect(requested).toEqual([build.download]);
+		expect(await Bun.file(targetPath).text()).toBe("installed omp 18.1.12");
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new"))).toEqual([]);
+	});
+
+	it("reports both causes when the GitHub release asset does not match the build", async () => {
+		const build = buildAnswer(version, content);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "omp-linux-x64");
+		await Bun.write(targetPath, "installed omp 18.1.12");
+		const requested: string[] = [];
+
+		await expect(
+			updateViaBinaryAt(targetPath, build, {
+				verifyInstalledVersion: async v => ({ ok: true, actual: v, path: targetPath }),
+				fetchImpl: async input => {
+					requested.push(String(input));
+					if (String(input) === build.download)
+						throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+					if (String(input) === fallbackUrl) return new Response(altered);
+					throw new Error(`Unexpected request: ${String(input)}`);
+				},
+			}),
+		).rejects.toThrow(/read ECONNRESET.*digest mismatch/s);
+
+		expect(requested).toEqual([build.download, fallbackUrl]);
+		expect(await Bun.file(targetPath).text()).toBe("installed omp 18.1.12");
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new"))).toEqual([]);
+	});
+
+	it("reports both causes when the fallback answers 404 (no GitHub release for the build)", async () => {
+		const build = buildAnswer(version, content);
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "omp-linux-x64");
+		await Bun.write(targetPath, "installed omp 18.1.12");
+		const requested: string[] = [];
+
+		await expect(
+			updateViaBinaryAt(targetPath, build, {
+				verifyInstalledVersion: async v => ({ ok: true, actual: v, path: targetPath }),
+				fetchImpl: async input => {
+					requested.push(String(input));
+					if (String(input) === build.download)
+						throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+					if (String(input) === fallbackUrl) return new Response(null, { status: 404, statusText: "Not Found" });
+					throw new Error(`Unexpected request: ${String(input)}`);
+				},
+			}),
+		).rejects.toThrow(/read ECONNRESET.*Download failed: 404 Not Found.*releases/s);
+
+		expect(requested).toEqual([build.download, fallbackUrl]);
+		expect(await Bun.file(targetPath).text()).toBe("installed omp 18.1.12");
+		expect((await fs.readdir(dir)).filter(name => name.endsWith(".new"))).toEqual([]);
 	});
 });

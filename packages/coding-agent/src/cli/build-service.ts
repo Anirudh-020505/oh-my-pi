@@ -52,6 +52,81 @@ const BUILD_CHECK_TIMEOUT_MS = 30_000;
 /** Ceiling of one build file download ({@link downloadBuildFile}); a temp file older than this is abandoned. */
 export const BUILD_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 
+/**
+ * How long a full-file download is observed before its pace is judged (default
+ * of {@link SlowDownloadOptions.observeMs}). Twenty seconds is long enough to
+ * smooth over a slow TLS handshake or first-byte delay on a small response,
+ * while still aborting a hopeless download (about 28 KB/s from a degraded
+ * build-service edge against the ~234 MB full file, projected past an hour)
+ * tens of minutes before {@link BUILD_DOWNLOAD_TIMEOUT_MS} would.
+ */
+const DOWNLOAD_OBSERVE_MS = 20_000;
+
+/**
+ * How long a full-file download may go without receiving any bytes before it
+ * is abandoned as stalled (default of {@link SlowDownloadOptions.stallMs}).
+ */
+const DOWNLOAD_STALL_MS = 30_000;
+
+/** Pacing ceiling for a full-file download; a hopeless download is abandoned early. */
+export interface SlowDownloadOptions {
+	/** Observe the download for this long before projecting its total time. Default 20 s. */
+	observeMs?: number;
+	/** Abandon the download after this long with no bytes received. Default 30 s. */
+	stallMs?: number;
+	/** Abandon the download when its projected total time exceeds this. Default {@link BUILD_DOWNLOAD_TIMEOUT_MS}. */
+	ceilingMs?: number;
+	/** Clock, injectable so tests can drive pacing deterministically. Defaults to `Date.now`. */
+	now?: () => number;
+}
+
+/** A full-file download abandoned as hopeless: projected too slow, or stalled. */
+export class SlowDownloadError extends Error {
+	constructor(message: string, options?: { cause?: unknown }) {
+		super(message, options);
+		this.name = "SlowDownloadError";
+	}
+}
+
+/** A download answered with an HTTP error status. */
+export class HttpStatusDownloadError extends Error {
+	/** The response's status code. */
+	readonly status: number;
+
+	constructor(status: number, statusText: string) {
+		super(`Download failed: ${status} ${statusText}`);
+		this.name = "HttpStatusDownloadError";
+		this.status = status;
+	}
+}
+
+const RETRYABLE_DOWNLOAD_CODES: Record<string, true> = {
+	ECONNRESET: true,
+	ECONNREFUSED: true,
+	ETIMEDOUT: true,
+	EPIPE: true,
+	EAI_AGAIN: true,
+	ENOTFOUND: true,
+};
+
+/**
+ * Whether a failed download may be retried from another source: it was
+ * abandoned as hopeless or stalled ({@link SlowDownloadError}), timed out,
+ * answered 5xx ({@link HttpStatusDownloadError}), or failed at the network
+ * level. A size or digest mismatch is an integrity failure, not a transient
+ * one: the bytes arrived, so a mirror would only launder the corruption.
+ */
+export function isRetryableDownloadError(err: unknown): boolean {
+	if (err instanceof SlowDownloadError) return true;
+	if (err instanceof HttpStatusDownloadError) return err.status >= 500;
+	for (let cause: unknown = err; cause instanceof Error; cause = cause.cause) {
+		if (isTimeoutError(cause)) return true;
+		const code = (cause as NodeJS.ErrnoException).code;
+		if (typeof code === "string" && code in RETRYABLE_DOWNLOAD_CODES) return true;
+	}
+	return false;
+}
+
 /** Build service origin: `PI_BUILD_URL` without trailing slashes, else {@link DEFAULT_BUILD_URL}. */
 export function buildServiceUrl(): string {
 	const configured = ($env.PI_BUILD_URL ?? "").trim().replace(/\/+$/, "");
@@ -343,6 +418,8 @@ export interface BuildFileDownloadOptions {
 	size: number;
 	/** Lowercase hex SHA-256 the build service answered for the file. */
 	sha256: string;
+	/** Pacing ceiling for the download; omit for the defaults in {@link SlowDownloadOptions}. */
+	slowDownload?: SlowDownloadOptions;
 	fetchImpl?: Fetch;
 	/** Bytes received so far, after each chunk. */
 	onProgress?: (received: number) => void;
@@ -363,10 +440,21 @@ async function unlinkIfExists(filePath: string): Promise<void> {
  * Throws on an HTTP error, a body larger than `size` (the stream is cancelled
  * at once), a final size or digest that differs, or no completion within
  * {@link BUILD_DOWNLOAD_TIMEOUT_MS}; nothing is left at `targetPath` then.
+ * With `slowDownload`, a download judged hopeless early — its projected total
+ * time exceeds the ceiling after the observation window, or it goes
+ * `stallMs` without bytes — is abandoned at once with a
+ * {@link SlowDownloadError}, so a caller may retry from another source.
  */
 export async function downloadBuildFile(options: BuildFileDownloadOptions): Promise<void> {
 	const fetchImpl = options.fetchImpl ?? fetch;
 	await unlinkIfExists(options.targetPath);
+	// Pacing is always on; `slowDownload` only overrides the thresholds (tests
+	// shrink them and inject `now`).
+	const pace = options.slowDownload;
+	const observeMs = pace?.observeMs ?? DOWNLOAD_OBSERVE_MS;
+	const stallMs = pace?.stallMs ?? DOWNLOAD_STALL_MS;
+	const ceilingMs = pace?.ceilingMs ?? BUILD_DOWNLOAD_TIMEOUT_MS;
+	const now = pace?.now ?? Date.now;
 	const timeoutError = (err: unknown) =>
 		new Error(`Timed out downloading ${options.url} after ${BUILD_DOWNLOAD_TIMEOUT_MS / 60_000} minutes`, {
 			cause: err,
@@ -384,13 +472,38 @@ export async function downloadBuildFile(options: BuildFileDownloadOptions): Prom
 		throw err;
 	}
 	if (!response.ok || !response.body) {
-		throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+		throw new HttpStatusDownloadError(response.status, response.statusText);
 	}
 
 	const hash = new Bun.SHA256();
 	let size = 0;
+	let startedAt: number | undefined;
+	let lastChunkAt: number | undefined;
 	const verifier = new Transform({
 		transform(chunk, _encoding, callback) {
+			const at = now();
+			const elapsed = at - (startedAt ?? at);
+			if (lastChunkAt !== undefined && at - lastChunkAt >= stallMs) {
+				callback(
+					new SlowDownloadError(
+						`Download of ${options.url} stalled: no bytes for ${(stallMs / 1000).toFixed(0)}s`,
+					),
+				);
+				return;
+			}
+			if (elapsed >= observeMs) {
+				const rate = size / Math.max(elapsed, 1);
+				if (elapsed + (options.size - size) / rate > ceilingMs) {
+					callback(
+						new SlowDownloadError(
+							`Download of ${options.url} is too slow: ${size} bytes in ${(elapsed / 1000).toFixed(0)}s projects past the ${(ceilingMs / 60_000).toFixed(0)}-minute ceiling`,
+						),
+					);
+					return;
+				}
+			}
+			startedAt ??= at;
+			lastChunkAt = at;
 			size += chunk.byteLength;
 			if (size > options.size) {
 				callback(new Error(`Download size mismatch: expected ${options.size} bytes, received at least ${size}`));
@@ -402,8 +515,37 @@ export async function downloadBuildFile(options: BuildFileDownloadOptions): Prom
 		},
 	});
 
+	// A stream that stops delivering bytes never reaches the transform again, so
+	// a wall-clock watchdog abandons the download when the injected or real
+	// clock says the gap has reached `stallMs`: the verifier is torn down and
+	// the race below rejects even though the pipeline itself stays pending.
+	const { promise: stalled, reject: abandon } = Promise.withResolvers<never>();
+	const watchdog: NodeJS.Timeout = setInterval(
+		() => {
+			if (lastChunkAt !== undefined && now() - lastChunkAt >= stallMs) {
+				verifier.destroy(
+					new SlowDownloadError(
+						`Download of ${options.url} stalled: no bytes for ${(stallMs / 1000).toFixed(0)}s`,
+					),
+				);
+				abandon(
+					new SlowDownloadError(
+						`Download of ${options.url} stalled: no bytes for ${(stallMs / 1000).toFixed(0)}s`,
+					),
+				);
+			}
+		},
+		Math.max(100, Math.min(stallMs, 5_000)),
+	);
+	// Whichever settles first wins the race; mark the loser handled so its late
+	// rejection is not reported as unhandled.
+	stalled.catch(() => {});
+
 	try {
-		await pipeline(response.body, verifier, fs.createWriteStream(options.targetPath, { mode: 0o600 }));
+		await Promise.race([
+			pipeline(response.body, verifier, fs.createWriteStream(options.targetPath, { mode: 0o600 })),
+			stalled,
+		]);
 		if (size !== options.size) {
 			throw new Error(`Download size mismatch: expected ${options.size} bytes, received ${size}`);
 		}
@@ -416,5 +558,7 @@ export async function downloadBuildFile(options: BuildFileDownloadOptions): Prom
 		if (isTimeoutError(err)) throw timeoutError(err);
 		if (isUnsupportedProxyError(err)) throw new Error(unsupportedProxyMessage(), { cause: err });
 		throw err;
+	} finally {
+		clearInterval(watchdog);
 	}
 }

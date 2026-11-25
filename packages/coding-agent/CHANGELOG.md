@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- `omp update` no longer hangs for most of the download ceiling on a network where the build service serves the full binary at a crawl: after a 20-second observation window a download projected to outlast the 15-minute ceiling is abandoned and retried from the byte-identical GitHub release asset, verified against the same size and SHA-256 (a stalled, timed-out, network-failed, or 5xx whole-file download retries the same way; a size or digest mismatch never does).
 - A broadcast from the main agent that arrives while a subagent is finishing no longer replaces that subagent's report; the subagent answers it in a separate turn, and the broadcast still interrupts a waiting subagent.
 - On Linux, `time -l` and `time -v` in the bash tool report the program's own maximum resident set size instead of at least omp's.
 
